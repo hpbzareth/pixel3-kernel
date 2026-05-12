@@ -37,45 +37,50 @@ jobs:
             gcc-multilib binutils
 
       # ─────────────────────────────────────────
+      - name: Cache Kernel Source
+        id: cache-kernel
+        uses: actions/cache@v4
+        with:
+          path: msm-kernel
+          key: kernel-${{ env.KERNEL_BRANCH }}-${{ hashFiles('.github/workflows/build-kernel.yml') }}
+
       - name: Clone Kernel Source
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
           echo "Cloning kernel: $KERNEL_BRANCH"
           git clone $KERNEL_REPO \
             -b $KERNEL_BRANCH \
             --depth=1 \
             msm-kernel
-          echo "Kernel source: $(cat msm-kernel/Makefile | grep "^VERSION\|^PATCHLEVEL\|^SUBLEVEL" | tr '\n' '.')"
 
       # ─────────────────────────────────────────
+      - name: Cache Toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: toolchain
+          key: toolchain-proton-clang-gcc49-v1
+
       - name: Setup Clang Toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
         run: |
           mkdir -p toolchain
-          # Google prebuilt Clang 12 — compatible với 4.9
-          wget -q --show-progress \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/${CLANG_VERSION}.tar.gz" \
-            -O toolchain/clang.tar.gz || true
-
-          # Fallback: proton-clang nếu google clang fail
-          if [ ! -s toolchain/clang.tar.gz ]; then
-            echo "Falling back to proton-clang..."
-            git clone https://github.com/kdrag0n/proton-clang \
-              --depth=1 toolchain/clang
-          else
-            mkdir -p toolchain/clang
-            tar -xf toolchain/clang.tar.gz -C toolchain/clang
-          fi
+          echo "Cloning proton-clang..."
+          git clone https://github.com/kdrag0n/proton-clang \
+            --depth=1 toolchain/clang
 
           echo "Clang: $(toolchain/clang/bin/clang --version | head -1)"
 
       # ─────────────────────────────────────────
       - name: Setup GCC Toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
         run: |
           git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
             --depth=1 toolchain/gcc-arm64 &
           git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 \
             --depth=1 toolchain/gcc-arm &
           wait
-          echo "GCC arm64: $(toolchain/gcc-arm64/bin/aarch64-linux-android-gcc --version | head -1)"
+          echo "GCC arm64 ready"
 
       # ─────────────────────────────────────────
       - name: Patch KernelSU Next
@@ -159,16 +164,28 @@ jobs:
       # ─────────────────────────────────────────
       - name: Build Kernel
         run: |
-          export PATH="$(pwd)/toolchain/clang/bin:$(pwd)/toolchain/gcc-arm64/bin:$(pwd)/toolchain/gcc-arm/bin:$PATH"
+          TC="$(pwd)/toolchain"
+          export PATH="${TC}/clang/bin:${TC}/gcc-arm64/bin:${TC}/gcc-arm/bin:$PATH"
+
+          # Bỏ clang's 'as' wrapper để vDSO32 dùng GCC arm assembler
+          mv ${TC}/clang/bin/as ${TC}/clang/bin/as.bak 2>/dev/null || true
 
           cd msm-kernel
           make \
             O=out \
             ARCH=arm64 \
             CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            HOSTCFLAGS="-gdwarf-4" \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CROSS_COMPILE_COMPAT=arm-linux-androideabi- \
             -j$(nproc) 2>&1 | tee ../build.log
 
           ls -lh out/arch/arm64/boot/Image.lz4-dtb
