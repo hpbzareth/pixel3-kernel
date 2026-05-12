@@ -34,7 +34,12 @@ jobs:
             git bc bison flex libssl-dev libelf-dev \
             build-essential python3 python3-pip \
             cpio rsync libncurses-dev zip curl wget \
-            gcc-multilib binutils
+            gcc-multilib binutils \
+            binutils-arm-linux-gnueabi
+
+          # Symlink để clang tìm thấy ARM32 assembler khi build vDSO32
+          sudo ln -sf /usr/bin/arm-linux-gnueabi-as \
+            /usr/local/bin/arm-linux-androideabi-as
 
       # ─────────────────────────────────────────
       - name: Cache Kernel Source
@@ -165,10 +170,7 @@ jobs:
       - name: Build Kernel
         run: |
           TC="$(pwd)/toolchain"
-          export PATH="${TC}/clang/bin:${TC}/gcc-arm64/bin:${TC}/gcc-arm/bin:$PATH"
-
-          # Bỏ clang's 'as' wrapper để vDSO32 dùng GCC arm assembler
-          mv ${TC}/clang/bin/as ${TC}/clang/bin/as.bak 2>/dev/null || true
+          export PATH="${TC}/clang/bin:${TC}/gcc-arm64/bin:${TC}/gcc-arm/bin:/usr/local/bin:$PATH"
 
           cd msm-kernel
           make \
