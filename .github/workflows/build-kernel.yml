@@ -101,22 +101,13 @@ jobs:
           cp -rv ../susfs4ksu/kernel_patches/fs/. fs/ 2>/dev/null || true
           cp -rv ../susfs4ksu/kernel_patches/include/. include/ 2>/dev/null || true
 
-          # Apply KSU-side susfs patch
+          # KSU-side patch — optional, skip nếu không tìm được dir
           KSU_PATCH=$(find "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/KernelSU" -name "*.patch" 2>/dev/null | head -1)
-          if [ -n "$KSU_PATCH" ]; then
+          if [ -n "$KSU_PATCH" ] && [ -d "KernelSU" ]; then
             echo "Applying KSU-side patch: $KSU_PATCH"
-            # Tìm KernelSU dir do setup.sh tạo ra
-            KSU_DIR=$(find "$GITHUB_WORKSPACE/msm-kernel" -maxdepth 2 -name "ksu.h" 2>/dev/null | head -1 | xargs -I{} dirname {} | xargs -I{} dirname {} || true)
-            if [ -d "$KSU_DIR" ]; then
-              echo "KernelSU dir: $KSU_DIR"
-              cd "$KSU_DIR"
-              patch -p1 --fuzz=3 < "$KSU_PATCH" || echo "KSU patch had some rejects, continuing..."
-              cd "$GITHUB_WORKSPACE/msm-kernel"
-            else
-              echo "KernelSU dir not found, skipping KSU-side patch"
-            fi
+            (cd KernelSU && patch -p1 --fuzz=3 < "$KSU_PATCH") || echo "KSU-side patch skipped (non-fatal)"
           else
-            echo "No KSU-side patch found, skipping"
+            echo "KSU-side patch skipped (KernelSU dir not found or no patch)"
           fi
 
           echo "SusFS patched"
