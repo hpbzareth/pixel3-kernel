@@ -1,0 +1,51 @@
+build_kernel_task:
+  name: "Pixel 3 Kernel (KSU Next + SusFS)"
+  container:
+    image: ubuntu:22.04
+    cpu: 8
+    memory: 16G
+
+  install_deps_script:
+    - apt-get update -qq
+    - apt-get install -y git bc bison flex libssl-dev libelf-dev
+        build-essential python3 cpio rsync zip curl wget binutils libncurses-dev
+
+  clone_kernel_script:
+    - git clone https://android.googlesource.com/kernel/msm
+        -b android-msm-crosshatch-4.9-android12 --depth=1 msm-kernel
+
+  clone_toolchain_script:
+    - git clone https://github.com/kdrag0n/proton-clang --depth=1 toolchain/clang
+    - git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 --depth=1 toolchain/gcc-arm64
+    - git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 --depth=1 toolchain/gcc-arm
+
+  patch_ksu_script:
+    - cd msm-kernel
+    - curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+
+  patch_susfs_script:
+    - git clone https://gitlab.com/simonpunk/susfs4ksu -b kernel-4.9 --depth=1 susfs4ksu
+    - cd msm-kernel
+    - patch -p1 --fuzz=3 < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.9.patch
+    - cp -rv ../susfs4ksu/kernel_patches/fs/. fs/ 2>/dev/null || true
+    - cp -rv ../susfs4ksu/kernel_patches/include/. include/ 2>/dev/null || true
+    - KSU_PATCH=$(find ../susfs4ksu/kernel_patches/KernelSU -name "*.patch" | head -1)
+    - if [ -n "$KSU_PATCH" ]; then cd KernelSU && patch -p1 --fuzz=3 < "../../$KSU_PATCH"; cd ..; fi
+
+  build_script:
+    - export PATH="$(pwd)/toolchain/clang/bin:$(pwd)/toolchain/gcc-arm64/bin:$(pwd)/toolchain/gcc-arm/bin:$PATH"
+    - cd msm-kernel
+    - make O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- b1c1_defconfig
+    - ./scripts/config --file out/.config -d CONFIG_LTO_CLANG -d CONFIG_LTO -d CONFIG_CFI_CLANG -d CONFIG_CC_STACKPROTECTOR_STRONG -e CONFIG_CC_STACKPROTECTOR_REGULAR -e CONFIG_OVERLAY_FS -e CONFIG_KSU -e CONFIG_KSU_SUSFS
+    - make O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- olddefconfig
+    - make O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi- -j$(nproc)
+
+  package_script:
+    - git clone https://github.com/osm0sis/AnyKernel3 anykernel --depth=1
+    - cp msm-kernel/out/arch/arm64/boot/Image.lz4-dtb anykernel/
+    - sed -i -e 's/^kernel.string=.*/kernel.string=KSU-Next + SusFS | Pixel 3/' -e 's/^device.name1=.*/device.name1=blueline/' anykernel/anykernel.sh
+    - cd anykernel && zip -r9 ../pixel3_ksu-next.zip . -x ".git/*"
+
+  kernel_artifacts:
+    path: "pixel3_ksu-next.zip"
+    type: application/zip
