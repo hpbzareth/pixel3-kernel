@@ -1,0 +1,7 @@
+msm-kernel/
+susfs4ksu/
+toolchain/
+AnyKernel3/
+out/
+*.log
+*.zip

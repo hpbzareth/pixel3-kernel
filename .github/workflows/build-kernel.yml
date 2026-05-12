@@ -1,0 +1,217 @@
+name: Build Pixel 3 Kernel (KSU Next + SusFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_branch:
+        description: 'KernelSU Next branch'
+        required: false
+        default: 'next'
+      susfs_branch:
+        description: 'SusFS branch'
+        required: false
+        default: 'kernel-4.9'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      KERNEL_REPO: https://android.googlesource.com/kernel/msm
+      KERNEL_BRANCH: android-msm-crosshatch-4.9-android12
+      DEFCONFIG: b1c1_defconfig
+      CLANG_VERSION: clang-r416183b  # Clang 12 — stable với kernel 4.9
+
+    steps:
+      # ─────────────────────────────────────────
+      - name: Checkout repo (for workflow files)
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git bc bison flex libssl-dev libelf-dev \
+            build-essential python3 python3-pip \
+            cpio rsync libncurses-dev zip curl wget \
+            gcc-multilib binutils
+
+      # ─────────────────────────────────────────
+      - name: Clone Kernel Source
+        run: |
+          echo "Cloning kernel: $KERNEL_BRANCH"
+          git clone $KERNEL_REPO \
+            -b $KERNEL_BRANCH \
+            --depth=1 \
+            msm-kernel
+          echo "Kernel source: $(cat msm-kernel/Makefile | grep "^VERSION\|^PATCHLEVEL\|^SUBLEVEL" | tr '\n' '.')"
+
+      # ─────────────────────────────────────────
+      - name: Setup Clang Toolchain
+        run: |
+          mkdir -p toolchain
+          # Google prebuilt Clang 12 — compatible với 4.9
+          wget -q --show-progress \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/${CLANG_VERSION}.tar.gz" \
+            -O toolchain/clang.tar.gz || true
+
+          # Fallback: proton-clang nếu google clang fail
+          if [ ! -s toolchain/clang.tar.gz ]; then
+            echo "Falling back to proton-clang..."
+            git clone https://github.com/kdrag0n/proton-clang \
+              --depth=1 toolchain/clang
+          else
+            mkdir -p toolchain/clang
+            tar -xf toolchain/clang.tar.gz -C toolchain/clang
+          fi
+
+          echo "Clang: $(toolchain/clang/bin/clang --version | head -1)"
+
+      # ─────────────────────────────────────────
+      - name: Setup GCC Toolchain
+        run: |
+          git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
+            --depth=1 toolchain/gcc-arm64 &
+          git clone https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 \
+            --depth=1 toolchain/gcc-arm &
+          wait
+          echo "GCC arm64: $(toolchain/gcc-arm64/bin/aarch64-linux-android-gcc --version | head -1)"
+
+      # ─────────────────────────────────────────
+      - name: Patch KernelSU Next
+        run: |
+          cd msm-kernel
+          KSU_BRANCH="${{ github.event.inputs.ksu_branch }}"
+          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/${KSU_BRANCH}/kernel/setup.sh" | bash -s "${KSU_BRANCH}"
+          echo "KSU version: $(cat KernelSU/kernel/ksu.h | grep 'KSU_VERSION' | head -1)"
+
+      # ─────────────────────────────────────────
+      - name: Patch SusFS
+        run: |
+          SUSFS_BRANCH="${{ github.event.inputs.susfs_branch }}"
+          git clone https://gitlab.com/simonpunk/susfs4ksu \
+            -b "$SUSFS_BRANCH" --depth=1 susfs4ksu
+
+          cd msm-kernel
+
+          # Apply kernel patch
+          patch -p1 --fuzz=3 < ../susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.9.patch
+
+          # Copy susfs source files
+          cp -rv ../susfs4ksu/kernel_patches/fs/. fs/ 2>/dev/null || true
+          cp -rv ../susfs4ksu/kernel_patches/include/. include/ 2>/dev/null || true
+
+          # Apply KSU-side susfs patch
+          KSU_PATCH=$(find ../susfs4ksu/kernel_patches/KernelSU -name "*.patch" 2>/dev/null | head -1)
+          if [ -n "$KSU_PATCH" ]; then
+            echo "Applying KSU-side patch: $KSU_PATCH"
+            cd KernelSU
+            patch -p1 --fuzz=3 < "../../$KSU_PATCH" || echo "KSU patch had some rejects, continuing..."
+            cd ..
+          fi
+
+          echo "SusFS patched"
+
+      # ─────────────────────────────────────────
+      - name: Configure Kernel
+        run: |
+          export PATH="$(pwd)/toolchain/clang/bin:$(pwd)/toolchain/gcc-arm64/bin:$(pwd)/toolchain/gcc-arm/bin:$PATH"
+
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            CC=clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-android-
+            CROSS_COMPILE_ARM32=arm-linux-androideabi-
+            -j$(nproc)
+          )
+
+          cd msm-kernel
+
+          make "${MAKE_ARGS[@]}" $DEFCONFIG
+
+          # Disable LTO/CFI (cần gold linker, không có trên runner)
+          ./scripts/config --file out/.config \
+            -d CONFIG_LTO_CLANG \
+            -d CONFIG_LTO \
+            -d CONFIG_CFI_CLANG \
+            -d CONFIG_CFI_PERMISSIVE
+
+          # Dùng STACKPROTECTOR_REGULAR thay STRONG nếu cần
+          ./scripts/config --file out/.config \
+            -d CONFIG_CC_STACKPROTECTOR_STRONG \
+            -e CONFIG_CC_STACKPROTECTOR_REGULAR
+
+          # Enable OverlayFS
+          ./scripts/config --file out/.config \
+            -e CONFIG_OVERLAY_FS \
+            -e CONFIG_OVERLAY_FS_REDIRECT_DIR \
+            -e CONFIG_OVERLAY_FS_INDEX
+
+          # Enable KSU + SusFS
+          ./scripts/config --file out/.config \
+            -e CONFIG_KSU \
+            -e CONFIG_KSU_SUSFS
+
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+      # ─────────────────────────────────────────
+      - name: Build Kernel
+        run: |
+          export PATH="$(pwd)/toolchain/clang/bin:$(pwd)/toolchain/gcc-arm64/bin:$(pwd)/toolchain/gcc-arm/bin:$PATH"
+
+          cd msm-kernel
+          make \
+            O=out \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            -j$(nproc) 2>&1 | tee ../build.log
+
+          ls -lh out/arch/arm64/boot/Image.lz4-dtb
+          echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+
+      # ─────────────────────────────────────────
+      - name: Package AnyKernel3
+        if: env.BUILD_SUCCESS == 'true'
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3 anykernel --depth=1
+
+          cp msm-kernel/out/arch/arm64/boot/Image.lz4-dtb anykernel/
+
+          sed -i \
+            -e 's/^kernel.string=.*/kernel.string=KSU-Next + SusFS | Pixel 3 (blueline)/' \
+            -e 's/^device.name1=.*/device.name1=blueline/' \
+            -e '/^device.name[2-9]/d' \
+            anykernel/anykernel.sh
+
+          ZIP_NAME="pixel3_ksu-next_$(date +%Y%m%d_%H%M).zip"
+          cd anykernel
+          zip -r9 "../${ZIP_NAME}" . -x ".git/*" "README.md"
+          cd ..
+
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          echo "Packaged: ${ZIP_NAME} ($(du -sh ${ZIP_NAME} | cut -f1))"
+
+      # ─────────────────────────────────────────
+      - name: Upload Kernel Artifact
+        if: env.BUILD_SUCCESS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pixel3-kernel-ksu-next
+          path: |
+            ${{ env.ZIP_NAME }}
+            build.log
+          retention-days: 30
+
+      # ─────────────────────────────────────────
+      - name: Upload Build Log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-failed
+          path: build.log
+          retention-days: 7
